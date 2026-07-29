@@ -21,7 +21,7 @@ local open = io.open
 local type = type
 local tonumber = tonumber
 
-local DB_FORMAT_VERSION = "4"
+local DB_FORMAT_VERSION = "6"
 local OPTION_KEYS = {"option", "options"}
 local TAG_KEYS = {"tag", "tags"}
 local FILE_KEYS = {"files", "file"}
@@ -157,8 +157,11 @@ local function generate_config_signature(rules)
     return s_format("%08x", hash)
 end
 
--- 重建数据库：一行中的每个制表符 value 都写成独立键值记录。
+-- 重建数据库：每个 value 独立存储，c 固定为同一逻辑 key 下的位置。
 local function rebuild(tasks, db)
+    local positions = {}
+    local seen_records = {}
+
     for _, task in ipairs(tasks) do
         local txt_path = task.path
         local prefix = task.prefix
@@ -174,6 +177,8 @@ local function rebuild(tasks, db)
                         local orig_k = k
                         if conversion then k = s_gsub(k, ".", conversion) end
 
+                        local db_key = prefix .. k
+
                         for v in s_gmatch(values, "[^\t]+") do
                             v = s_match(v, "^%s*(.-)%s*$")
 
@@ -185,13 +190,23 @@ local function rebuild(tasks, db)
                                 end
 
                                 local raw_key =
-                                    userdb.make_record_key(prefix .. k, v)
+                                    userdb.make_record_key(db_key, v)
 
-                                if raw_key and not db:update_raw(
-                                    raw_key, userdb.DEFAULT_RECORD_TAIL
-                                ) then
-                                    f:close()
-                                    return false
+                                if raw_key and not seen_records[raw_key] then
+                                    seen_records[raw_key] = true
+
+                                    local position =
+                                        (positions[db_key] or 0) + 1
+                                    positions[db_key] = position
+
+                                    local tail = userdb.make_record_tail(
+                                        position, 0, 0
+                                    )
+
+                                    if not db:update_raw(raw_key, tail) then
+                                        f:close()
+                                        return false
+                                    end
                                 end
                             end
                         end
@@ -206,24 +221,47 @@ local function rebuild(tasks, db)
     return true
 end
 
--- 按逻辑 key 查询全部 value，并临时合并为现有规则使用的字符串。
+-- 从记录尾部读取候选在当前逻辑 key 下的位置。
+local function parse_position(tail)
+    if type(tail) ~= "string" then return 0 end
+    return tonumber(s_match(tail, "c=([^%s\t]+)")) or 0
+end
+
+-- 按逻辑 key 查询全部 value，并按固定位置恢复源文件顺序。
 local function fetch_values(db, key, delimiter)
     local accessor = db:query(key .. userdb.RECORD_KEY_SEPARATOR)
     if not accessor then return nil end
 
-    local values = {}
+    local records = {}
     local count = 0
 
-    for record_key, value in accessor:iter() do
+    for record_key, value, tail in accessor:iter() do
         if record_key ~= key then break end
 
         count = count + 1
-        values[count] = value
+        records[count] = {
+            value = value,
+            position = parse_position(tail),
+            index = count,
+        }
     end
 
     accessor = nil
 
     if count == 0 then return nil end
+
+    t_sort(records, function(a, b)
+        if a.position ~= b.position then
+            if a.position == 0 then return false end
+            if b.position == 0 then return true end
+            return a.position < b.position
+        end
+
+        return a.index < b.index
+    end)
+
+    local values = {}
+    for i = 1, count do values[i] = records[i].value end
     return concat(values, delimiter, 1, count)
 end
 
@@ -588,9 +626,45 @@ end
 local function parse_item(p, delim)
     if delim and delim ~= "" then
         local pos = s_find(p, delim, 1, true)
-        if pos then return s_sub(p, 1, pos - 1), s_sub(p, pos + #delim) end
+        if pos then
+            return s_sub(p, 1, pos - 1),
+                s_sub(p, pos + #delim)
+        end
     end
+
     return p, nil
+end
+
+-- 判断候选文本是否只包含英文字母。
+local function is_alpha_text(text)
+    if not text or text == "" then return false end
+
+    for i = 1, #text do
+        local b = s_byte(text, i)
+
+        if not ((b >= 65 and b <= 90)
+            or (b >= 97 and b <= 122))
+        then
+            return false
+        end
+    end
+
+    return true
+end
+
+-- 判断候选是否可作为简码前置位置的正常候选。
+local function is_regular_candidate(cand)
+    local cand_type = cand and cand.type or ""
+
+    if cand_type == "phrase"
+        or cand_type == "user_phrase"
+        or cand_type == "user_table"
+    then
+        return true
+    end
+
+    return cand_type == "table"
+        and not is_alpha_text(cand.text or "")
 end
 
 -- [Core Function] 核心逻辑
@@ -714,7 +788,6 @@ function M.func(input, env)
                 end
 
                 if mode == "comment" then
-                    -- 直接汇入共享数组；最终 concat 结果与原来的分规则 parts 完全一致。
                     for p in s_gmatch(val, split_pat) do
                         if p ~= input_code then shared_comments[#shared_comments + 1] = p end
                     end
@@ -793,30 +866,37 @@ function M.func(input, env)
     local global_yielded = {}
     local always_cands = {}
     local lazy_cands = {}
-    local group_fronted = {}
 
-    local query_code = s_gsub(input_code, env.speller_delimiter, "")
+    local query_code =
+        s_gsub(input_code, env.speller_delimiter, "")
+
     if s_match(ctx.input, "^[a-zA-Z]+$") then
-        query_code = s_gsub(ctx.input, env.speller_delimiter, "")
+        query_code =
+            s_gsub(ctx.input, env.speller_delimiter, "")
     end
 
     if query_code ~= "" then
         for _, t in ipairs(active_abbrev_rules) do
             local val = fetch_cached(t.prefix .. query_code)
+
             if not val and not s_match(query_code, "[A-Z]") then
-                val = fetch_cached(t.prefix .. s_upper(query_code))
+                val = fetch_cached(
+                    t.prefix .. s_upper(query_code)
+                )
             end
 
             if val then
                 local count = 0
-                local group_key = t.prefix
 
                 for p in s_gmatch(val, split_pat) do
-                    local item_text, item_preedit = parse_item(p, t.preedit_delim)
+                    local item_text, item_preedit =
+                        parse_item(p, t.preedit_delim)
+
                     if not seen_texts[item_text] then
                         seen_texts[item_text] = true
 
-                        local final_type = t.cand_type or "abbrev"
+                        local final_type =
+                            t.cand_type or "abbrev"
                         local abbrev_cand = Candidate(
                             final_type,
                             seg and seg.start or 0,
@@ -824,23 +904,29 @@ function M.func(input, env)
                             item_text,
                             ""
                         )
-                        if item_preedit and item_preedit ~= "" then abbrev_cand.preedit = item_preedit end
+
+                        if item_preedit
+                            and item_preedit ~= ""
+                        then
+                            abbrev_cand.preedit =
+                                item_preedit
+                        end
 
                         count = count + 1
+
                         if count <= t.always_qty then
                             abbrev_cand.quality = 999
                             always_cands[#always_cands + 1] = {
                                 cand = abbrev_cand,
-                                index = t.always_idx + count - 1,
-                                group_key = group_key,
-                                yielded = false
+                                index =
+                                    t.always_idx + count - 1,
+                                yielded = false,
                             }
                         else
                             abbrev_cand.quality = 98
                             lazy_cands[#lazy_cands + 1] = {
                                 cand = abbrev_cand,
-                                group_key = group_key,
-                                yielded = false
+                                yielded = false,
                             }
                         end
                     end
@@ -852,140 +938,134 @@ function M.func(input, env)
     local function emit_processed(cand, results, count_yield)
         for _, pc in ipairs(process_rules(cand, results)) do
             local key = trim_space(pc.text)
+
             if not global_yielded[key] then
                 global_yielded[key] = true
                 yield(pc)
-                if count_yield then yield_count = yield_count + 1 end
+
+                if count_yield then
+                    yield_count = yield_count + 1
+                end
             end
         end
     end
 
     if #always_cands == 0 and #lazy_cands == 0 then
-        for cand in input:iter() do emit_processed(cand, main_results, false) end
+        for cand in input:iter() do
+            emit_processed(cand, main_results, false)
+        end
+
         return
     end
 
-    t_sort(always_cands, function(a, b) return a.index < b.index end)
+    t_sort(always_cands, function(a, b)
+        return a.index < b.index
+    end)
 
     local abbrev_lookup = {}
+
     for _, item in ipairs(always_cands) do
-        abbrev_lookup[trim_space(item.cand.text)] = { type = "always", ref = item }
+        abbrev_lookup[trim_space(item.cand.text)] = {
+            type = "always",
+            ref = item,
+        }
     end
+
     for _, item in ipairs(lazy_cands) do
-        abbrev_lookup[trim_space(item.cand.text)] = { type = "lazy", ref = item }
+        abbrev_lookup[trim_space(item.cand.text)] = {
+            type = "lazy",
+            ref = item,
+        }
     end
 
     local abbrevs_dumped = false
-    local function dump_all_abbrevs()
+
+    local function dump_abbrevs(include_lazy)
         if abbrevs_dumped then return end
         abbrevs_dumped = true
 
         for _, item in ipairs(always_cands) do
             if not item.yielded then
                 item.yielded = true
-                emit_processed(item.cand, aux_results, true)
+                emit_processed(
+                    item.cand, aux_results, true
+                )
             end
         end
 
-        for _, item in ipairs(lazy_cands) do
-            if not item.yielded then
-                item.yielded = true
-                if not group_fronted[item.group_key] then
-                    emit_processed(item.cand, aux_results, true)
+        if include_lazy then
+            for _, item in ipairs(lazy_cands) do
+                if not item.yielded then
+                    item.yielded = true
+                    emit_processed(
+                        item.cand, aux_results, true
+                    )
                 end
             end
         end
     end
 
-    local iter_func, state, iter_var = input:iter()
-    local lookahead_cache = {}
-    local has_phrase = false
-    local is_exhausted = false
-
-    while #lookahead_cache < 30 do
-        iter_var = iter_func(state, iter_var)
-        if not iter_var then
-            is_exhausted = true
-            break
-        end
-
-        lookahead_cache[#lookahead_cache + 1] = iter_var
-        if iter_var.type == "phrase" then
-            has_phrase = true
-            break
-        end
-    end
-
-    local cache_idx = 1
-    local function get_next_cand()
-        if cache_idx <= #lookahead_cache then
-            local c = lookahead_cache[cache_idx]
-            cache_idx = cache_idx + 1
-            return c
-        end
-
-        if not is_exhausted then
-            iter_var = iter_func(state, iter_var)
-            if not iter_var then is_exhausted = true end
-            return iter_var
-        end
-
-        return nil
-    end
-
-    local cand = get_next_cand()
     local next_always_ptr = 1
+    local saw_regular_candidate = false
 
-    while cand do
-        local processed_cands = process_rules(cand, main_results)
+    for cand in input:iter() do
+        local processed_cands =
+            process_rules(cand, main_results)
 
         for _, pc in ipairs(processed_cands) do
             local dedup_key = trim_space(pc.text)
 
             if not global_yielded[dedup_key] then
-                local c_type = cand.type or ""
-                local is_user = c_type == "user_phrase" or c_type == "user_table"
-                local is_regular = c_type == "phrase" or (c_type == "table" and has_phrase)
-                local match_info = abbrev_lookup[dedup_key]
-                local is_reserved = match_info ~= nil
+                local cand_type = cand.type or ""
+                local is_user =
+                    cand_type == "user_phrase"
+                    or cand_type == "user_table"
+                local is_regular =
+                    is_regular_candidate(cand)
+                    and not is_user
+                local match_info =
+                    abbrev_lookup[dedup_key]
+                local is_reserved =
+                    match_info ~= nil
 
-                if is_user then
+                if is_user or is_regular then
+                    saw_regular_candidate = true
+
                     if is_reserved then
                         match_info.ref.yielded = true
-                        if match_info.type == "always" then
-                            group_fronted[match_info.ref.group_key] = true
-                        end
                     end
 
-                    global_yielded[dedup_key] = true
-                    yield(pc)
-                    yield_count = yield_count + 1
-                elseif is_regular then
-                    while next_always_ptr <= #always_cands do
-                        local item = always_cands[next_always_ptr]
+                    while next_always_ptr
+                        <= #always_cands
+                    do
+                        local item =
+                            always_cands[next_always_ptr]
 
                         if item.yielded then
-                            next_always_ptr = next_always_ptr + 1
-                        elseif yield_count + 1 >= item.index then
+                            next_always_ptr =
+                                next_always_ptr + 1
+                        elseif yield_count + 1
+                            >= item.index
+                        then
                             item.yielded = true
-                            group_fronted[item.group_key] = true
-
-                            emit_processed(item.cand, aux_results, true)
-
-                            next_always_ptr = next_always_ptr + 1
+                            emit_processed(
+                                item.cand,
+                                aux_results,
+                                true
+                            )
+                            next_always_ptr =
+                                next_always_ptr + 1
                         else
                             break
                         end
                     end
 
-                    if not is_reserved then
+                    if not is_reserved or is_user then
                         global_yielded[dedup_key] = true
                         yield(pc)
                         yield_count = yield_count + 1
                     end
                 else
-                    dump_all_abbrevs()
-
                     if not is_reserved then
                         global_yielded[dedup_key] = true
                         yield(pc)
@@ -994,10 +1074,7 @@ function M.func(input, env)
                 end
             end
         end
-
-        cand = get_next_cand()
     end
-
-    dump_all_abbrevs()
+    dump_abbrevs(not saw_regular_candidate)
 end
 return M
